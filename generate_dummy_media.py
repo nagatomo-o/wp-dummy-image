@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
+import urllib.parse
 from pathlib import Path, PurePosixPath
 
 from PIL import Image
+
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+
+_UPLOADS_PATH = re.compile(
+    r"(?<![A-Za-z0-9])uploads/([^?\s\"'<>\\]+)",
+    re.IGNORECASE,
+)
+_TRAILING_PATH_CHARS = ".,);]"
 
 
 class PhpSerializeError(Exception):
@@ -88,6 +98,26 @@ class _Parser:
 
 def php_unserialize(data: str):
     return _Parser(data).parse()
+
+
+def uploads_paths(text: str) -> list[str]:
+    normalized = text.replace("\\/", "/")
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _UPLOADS_PATH.findall(normalized):
+        relative = urllib.parse.unquote(match).replace("\\", "/").strip("/")
+        relative = relative.rstrip(_TRAILING_PATH_CHARS)
+        if not relative or relative in seen:
+            continue
+        if any(part == ".." for part in PurePosixPath(relative).parts):
+            continue
+        seen.add(relative)
+        found.append(relative)
+    return found
+
+
+def _normalize_relative(path: str) -> str:
+    return path.replace("\\", "/").strip().strip("/")
 
 
 COLOR = (127, 127, 127)
@@ -220,7 +250,7 @@ def write_image(path: Path, width: int, height: int) -> bool:
     return True
 
 
-def generate(csv_path: Path, out_dir: Path) -> tuple[int, int, int]:
+def _read_csv_rows(csv_path: Path, required: tuple[str, ...]) -> list[dict]:
     try:
         handle = csv_path.open(encoding="utf-8", newline="")
     except OSError as exc:
@@ -228,9 +258,43 @@ def generate(csv_path: Path, out_dir: Path) -> tuple[int, int, int]:
     with handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
-        if any(name not in fieldnames for name in REQUIRED_COLUMNS):
+        if any(name not in fieldnames for name in required):
             raise GenerateError("必要な列がありません")
-        rows = list(reader)
+        return list(reader)
+
+
+def _option_target(relative_path: str) -> dict:
+    suffix = PurePosixPath(relative_path).suffix.lower()
+    if suffix in IMAGE_FORMATS:
+        return {
+            "relative_path": relative_path,
+            "kind": "image",
+            "width": DEFAULT_SIZE,
+            "height": DEFAULT_SIZE,
+        }
+    return {
+        "relative_path": relative_path,
+        "kind": "empty",
+        "width": None,
+        "height": None,
+    }
+
+
+def generate(
+    csv_path: Path,
+    out_dir: Path,
+    options_path: Path | None = None,
+) -> tuple[int, int, int]:
+    rows = _read_csv_rows(csv_path, REQUIRED_COLUMNS)
+    option_paths: list[str] = []
+    if options_path is not None:
+        seen: set[str] = set()
+        for row in _read_csv_rows(options_path, ("option_value",)):
+            for relative in uploads_paths(row.get("option_value") or ""):
+                if relative in seen:
+                    continue
+                seen.add(relative)
+                option_paths.append(relative)
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -238,6 +302,7 @@ def generate(csv_path: Path, out_dir: Path) -> tuple[int, int, int]:
     images = 0
     empties = 0
     skips = 0
+    written: set[str] = set()
     for row in rows:
         targets = attachment_targets(
             row.get("file_path") or "",
@@ -245,28 +310,48 @@ def generate(csv_path: Path, out_dir: Path) -> tuple[int, int, int]:
             row.get("metadata_raw") or "",
         )
         for target in targets:
-            destination = safe_output_path(out_dir, target["relative_path"])
-            if destination is None:
-                skips += 1
-                continue
-            if target["kind"] == "empty":
-                write_empty(destination)
-                empties += 1
-                continue
-            if write_image(destination, target["width"], target["height"]):
+            kind = _write_target(out_dir, target)
+            if kind == "image":
                 images += 1
+                written.add(_normalize_relative(target["relative_path"]))
+            elif kind == "empty":
+                empties += 1
+                written.add(_normalize_relative(target["relative_path"]))
             else:
                 skips += 1
+    for relative in option_paths:
+        if relative in written:
+            continue
+        kind = _write_target(out_dir, _option_target(relative))
+        if kind == "image":
+            images += 1
+        elif kind == "empty":
+            empties += 1
+        else:
+            skips += 1
     return images, empties, skips
+
+
+def _write_target(out_dir: Path, target: dict) -> str:
+    destination = safe_output_path(out_dir, target["relative_path"])
+    if destination is None:
+        return "skip"
+    if target["kind"] == "empty":
+        write_empty(destination)
+        return "empty"
+    if write_image(destination, target["width"], target["height"]):
+        return "image"
+    return "skip"
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="添付ファイル一覧からダミーメディアを作ります")
     parser.add_argument("--csv", required=True, type=Path)
+    parser.add_argument("--options", type=Path)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
-        images, empties, skips = generate(args.csv, args.out)
+        images, empties, skips = generate(args.csv, args.out, args.options)
     except GenerateError as exc:
         print(str(exc), file=sys.stderr)
         return 1

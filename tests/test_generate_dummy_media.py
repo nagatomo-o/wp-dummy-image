@@ -16,6 +16,7 @@ from generate_dummy_media import (
     main,
     php_unserialize,
     safe_output_path,
+    uploads_paths,
     write_empty,
     write_image,
 )
@@ -313,6 +314,78 @@ class GenerateTests(unittest.TestCase):
                 generate(root / "missing.csv", root / "uploads")
             self.assertEqual(str(caught.exception), "CSVを開けません")
             self.assertFalse((root / "uploads").exists())
+
+
+class OptionPathTests(unittest.TestCase):
+    def test_collects_uploads_paths_once(self):
+        text = (
+            's:51:"//localhost/wp-content/uploads/2019/01/slider03.jpg";'
+            " /uploads/2019/01/slider03.jpg"
+            " http://localhost/wp-content/uploads/2019/06/note.pdf"
+            " notuploads/skip.jpg"
+        )
+        self.assertEqual(
+            uploads_paths(text),
+            ["2019/01/slider03.jpg", "2019/06/note.pdf"],
+        )
+
+    def test_options_add_missing_files_without_replacing_sized_media(self):
+        metadata = 'a:2:{s:5:"width";i:10;s:6:"height";i:20;}'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "media.csv"
+            options_path = root / "options.csv"
+            out_dir = root / "uploads"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["file_path", "mime_type", "metadata_raw"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "file_path": "2018/10/kept.jpg",
+                        "mime_type": "image/jpeg",
+                        "metadata_raw": metadata,
+                    }
+                )
+            with options_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["option_id", "option_name", "option_value", "autoload"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "option_id": "1",
+                        "option_name": "biz_vektor_theme_options",
+                        "option_value": (
+                            "//localhost/wp-content/uploads/2018/10/kept.jpg "
+                            "/uploads/2019/01/slider03.jpg "
+                            "uploads/2019/06/note.pdf"
+                        ),
+                        "autoload": "yes",
+                    }
+                )
+            images, empties, skips = generate(csv_path, out_dir, options_path)
+            self.assertEqual((images, empties, skips), (2, 1, 0))
+            self.assertEqual(Image.open(out_dir / "2018/10/kept.jpg").size, (10, 20))
+            self.assertEqual(Image.open(out_dir / "2019/01/slider03.jpg").size, (32, 32))
+            self.assertEqual((out_dir / "2019/06/note.pdf").read_bytes(), b"")
+
+    def test_missing_options_creates_no_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "media.csv"
+            csv_path.write_text(
+                "file_path,mime_type,metadata_raw\n",
+                encoding="utf-8",
+            )
+            out_dir = root / "uploads"
+            with self.assertRaises(GenerateError) as caught:
+                generate(csv_path, out_dir, root / "missing-options.csv")
+            self.assertEqual(str(caught.exception), "CSVを開けません")
+            self.assertFalse(out_dir.exists())
 
 
 class CommandTests(unittest.TestCase):
