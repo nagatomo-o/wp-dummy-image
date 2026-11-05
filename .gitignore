@@ -1,0 +1,9 @@
+__pycache__
+docs
+tests/__pycache__
+*.jpg
+*.png
+*.pdf
+*.gif
+*.ico
+*.csv
