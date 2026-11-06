@@ -116,8 +116,18 @@ def uploads_paths(text: str) -> list[str]:
     return found
 
 
+def _strip_uploads_root(normalized: str) -> str:
+    marker = "/wp-content/uploads/"
+    index = normalized.lower().find(marker)
+    if index < 0:
+        return normalized
+    relative = normalized[index + len(marker):]
+    return relative.split("?", 1)[0].split("#", 1)[0]
+
+
 def _normalize_relative(path: str) -> str:
-    return path.replace("\\", "/").strip().strip("/")
+    normalized = path.replace("\\", "/").strip()
+    return _strip_uploads_root(normalized).strip().strip("/")
 
 
 COLOR = (127, 127, 127)
@@ -129,6 +139,7 @@ IMAGE_FORMATS = {
     ".png": "PNG",
     ".gif": "GIF",
     ".ico": "ICO",
+    ".bmp": "BMP",
 }
 REQUIRED_COLUMNS = ("file_path", "mime_type", "metadata_raw")
 DEFAULT_SIZE = 32
@@ -202,25 +213,32 @@ def attachment_targets(file_path: str, mime_type: str, metadata_raw: str) -> lis
     return targets
 
 
-def safe_output_path(out_dir: Path, relative_path: str) -> Path | None:
+def _resolve_output_path(out_dir: Path, relative_path: str) -> tuple[Path | None, str | None]:
     text = relative_path.strip()
     if not text:
-        return None
-    normalized = text.replace("\\", "/")
+        return None, "パスが空です"
+    normalized = _strip_uploads_root(text.replace("\\", "/")).strip()
+    if not normalized:
+        return None, "パスが空です"
     if normalized.startswith("/") or (len(normalized) >= 2 and normalized[1] == ":"):
-        return None
+        return None, "絶対パスです"
     path = PurePosixPath(normalized)
     if any(part == ".." for part in path.parts):
-        return None
+        return None, "パスに .. が含まれます"
     root = out_dir.resolve()
     destination = root.joinpath(*path.parts)
     resolved = destination.resolve()
     try:
         resolved.relative_to(root)
     except ValueError:
-        return None
+        return None, "出力先の外に出ます"
     if resolved == root:
-        return None
+        return None, "出力先そのものです"
+    return destination, None
+
+
+def safe_output_path(out_dir: Path, relative_path: str) -> Path | None:
+    destination, _reason = _resolve_output_path(out_dir, relative_path)
     return destination
 
 
@@ -229,12 +247,18 @@ def write_empty(path: Path) -> None:
     path.write_bytes(b"")
 
 
-def write_image(path: Path, width: int, height: int) -> bool:
+def image_skip_reason(path: Path, width: int, height: int) -> str | None:
     if width < 1 or height < 1 or width > MAX_DIMENSION or height > MAX_DIMENSION:
+        return f"幅または高さが範囲外です: {width}x{height}"
+    if path.suffix.lower() not in IMAGE_FORMATS:
+        return "画像の拡張子に対応していません"
+    return None
+
+
+def write_image(path: Path, width: int, height: int) -> bool:
+    if image_skip_reason(path, width, height) is not None:
         return False
-    image_format = IMAGE_FORMATS.get(path.suffix.lower())
-    if image_format is None:
-        return False
+    image_format = IMAGE_FORMATS[path.suffix.lower()]
     path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.new("RGB", (width, height), COLOR)
     if image_format == "JPEG":
@@ -310,7 +334,7 @@ def generate(
             row.get("metadata_raw") or "",
         )
         for target in targets:
-            kind = _write_target(out_dir, target)
+            kind, reason = _write_target(out_dir, target)
             if kind == "image":
                 images += 1
                 written.add(_normalize_relative(target["relative_path"]))
@@ -319,29 +343,38 @@ def generate(
                 written.add(_normalize_relative(target["relative_path"]))
             else:
                 skips += 1
+                _report_skip(target["relative_path"], reason)
     for relative in option_paths:
         if relative in written:
             continue
-        kind = _write_target(out_dir, _option_target(relative))
+        kind, reason = _write_target(out_dir, _option_target(relative))
         if kind == "image":
             images += 1
         elif kind == "empty":
             empties += 1
         else:
             skips += 1
+            _report_skip(relative, reason)
     return images, empties, skips
 
 
-def _write_target(out_dir: Path, target: dict) -> str:
-    destination = safe_output_path(out_dir, target["relative_path"])
+def _report_skip(relative_path: str, reason: str | None) -> None:
+    name = relative_path.strip() or "(空のパス)"
+    print(f"{name}: {reason}")
+
+
+def _write_target(out_dir: Path, target: dict) -> tuple[str, str | None]:
+    destination, reason = _resolve_output_path(out_dir, target["relative_path"])
     if destination is None:
-        return "skip"
+        return "skip", reason
     if target["kind"] == "empty":
         write_empty(destination)
-        return "empty"
-    if write_image(destination, target["width"], target["height"]):
-        return "image"
-    return "skip"
+        return "empty", None
+    reason = image_skip_reason(destination, target["width"], target["height"])
+    if reason is not None:
+        return "skip", reason
+    write_image(destination, target["width"], target["height"])
+    return "image", None
 
 
 def main(argv: list[str] | None = None) -> int:

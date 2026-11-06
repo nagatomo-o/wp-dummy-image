@@ -159,6 +159,29 @@ class OutputPathTests(unittest.TestCase):
             self.assertIsNone(safe_output_path(out_dir, ""))
             self.assertIsNone(safe_output_path(out_dir, "   "))
 
+    def test_accepts_absolute_path_under_wp_content_uploads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            expected = out_dir.resolve().joinpath("2019", "01", "scan.bmp")
+            self.assertEqual(
+                safe_output_path(
+                    out_dir,
+                    "http://localhost/wp-content/uploads/2019/01/scan.bmp",
+                ),
+                expected,
+            )
+            self.assertEqual(
+                safe_output_path(out_dir, "/wp-content/uploads/2019/01/scan.bmp"),
+                expected,
+            )
+            self.assertEqual(
+                safe_output_path(
+                    out_dir,
+                    "C:/site/wp-content/uploads/2019/01/scan.bmp",
+                ),
+                expected,
+            )
+
 
 class ImageWriteTests(unittest.TestCase):
     def test_png_gif_and_ico_use_exact_pale_color(self):
@@ -167,7 +190,13 @@ class ImageWriteTests(unittest.TestCase):
             self.assertTrue(write_image(out_dir / "a.png", 8, 4))
             self.assertTrue(write_image(out_dir / "a.gif", 8, 4))
             self.assertTrue(write_image(out_dir / "a.ico", 32, 32))
-            for name, size in (("a.png", (8, 4)), ("a.gif", (8, 4)), ("a.ico", (32, 32))):
+            self.assertTrue(write_image(out_dir / "a.bmp", 8, 4))
+            for name, size in (
+                ("a.png", (8, 4)),
+                ("a.gif", (8, 4)),
+                ("a.ico", (32, 32)),
+                ("a.bmp", (8, 4)),
+            ):
                 image = Image.open(out_dir / name).convert("RGB")
                 self.assertEqual(image.size, size)
                 self.assertEqual(image.getpixel((0, 0)), COLOR)
@@ -245,6 +274,38 @@ class GenerateTests(unittest.TestCase):
             )
             self.assertEqual((out_dir / "2019/06/a.pdf").read_bytes(), b"")
 
+    def test_writes_bmp_from_wp_content_uploads_url(self):
+        metadata = (
+            'a:3:{s:5:"width";i:12;s:6:"height";i:8;s:5:"sizes";a:1:{'
+            's:9:"thumbnail";a:3:{s:4:"file";s:14:"scan-10x10.bmp";'
+            's:5:"width";i:10;s:6:"height";i:10;}}}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "media.csv"
+            out_dir = root / "uploads"
+            self._write_csv(
+                csv_path,
+                [
+                    {
+                        "file_path": "http://localhost/wp-content/uploads/2019/01/scan.bmp",
+                        "mime_type": "image/bmp",
+                        "metadata_raw": metadata,
+                    }
+                ],
+            )
+            images, empties, skips = generate(csv_path, out_dir)
+            self.assertEqual((images, empties, skips), (2, 0, 0))
+            self.assertEqual(Image.open(out_dir / "2019/01/scan.bmp").size, (12, 8))
+            self.assertEqual(
+                Image.open(out_dir / "2019/01/scan-10x10.bmp").size,
+                (10, 10),
+            )
+            self.assertEqual(
+                Image.open(out_dir / "2019/01/scan.bmp").convert("RGB").getpixel((0, 0)),
+                COLOR,
+            )
+
     def test_skips_only_the_rejected_file_in_a_row(self):
         metadata = (
             'a:3:{s:5:"width";i:8001;s:6:"height";i:1;s:5:"sizes";a:1:{'
@@ -273,10 +334,26 @@ class GenerateTests(unittest.TestCase):
                         "mime_type": "image/jpeg",
                         "metadata_raw": "NULL",
                     },
+                    {
+                        "file_path": "photo.webp",
+                        "mime_type": "image/webp",
+                        "metadata_raw": "NULL",
+                    },
                 ],
             )
-            images, empties, skips = generate(csv_path, out_dir)
-            self.assertEqual((images, empties, skips), (1, 0, 3))
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                images, empties, skips = generate(csv_path, out_dir)
+            self.assertEqual((images, empties, skips), (1, 0, 4))
+            self.assertEqual(
+                stdout.getvalue().splitlines(),
+                [
+                    "wide.jpg: 幅または高さが範囲外です: 8001x1",
+                    "../secret.jpg: パスに .. が含まれます",
+                    "(空のパス): パスが空です",
+                    "photo.webp: 画像の拡張子に対応していません",
+                ],
+            )
             self.assertEqual(Image.open(out_dir / "tiny.jpg").size, (10, 10))
             self.assertFalse((out_dir / "wide.jpg").exists())
             self.assertFalse((root / "secret.jpg").exists())
@@ -427,7 +504,12 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 stdout.getvalue().splitlines(),
-                ["画像: 1", "空ファイル: 1", "スキップ: 1"],
+                [
+                    "../secret.jpg: パスに .. が含まれます",
+                    "画像: 1",
+                    "空ファイル: 1",
+                    "スキップ: 1",
+                ],
             )
 
     def test_returns_one_when_output_cannot_be_created(self):
